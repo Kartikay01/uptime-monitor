@@ -37,8 +37,11 @@ container restarts and rebuilds. To wipe it: `docker compose down -v`.
 **Backend**
 ```bash
 cd backend
+python -m venv venv
+source venv/bin/activate        # Windows: venv\Scripts\activate
 pip install -r requirements.txt
-uvicorn main:app --reload --host 0.0.0.0 --port 8000
+mkdir -p data                   # required — SQLite won't create this dir itself
+uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
 **Frontend**
@@ -55,13 +58,13 @@ http://localhost:8000 (configured in `frontend/src/services/apiClient.ts`).
 
 ### Backend API — manual smoke test
 
-With the stack running, exercise the two endpoints directly:
+With the stack running, exercise the endpoints directly:
 
 ```bash
 # List monitors (should return [] on a fresh DB)
 curl http://localhost:8000/urls
 
-# Create a monitor
+# Create a monitor that will pass health checks
 curl -X POST http://localhost:8000/urls \
   -H "Content-Type: application/json" \
   -d '{"url": "https://example.com", "label": "Example"}'
@@ -71,7 +74,11 @@ curl -X POST http://localhost:8000/urls \
   -H "Content-Type: application/json" \
   -d '{"url": "http://localhost:1/does-not-exist", "label": "Broken"}'
 
-# Confirm it now appears with a latest_check
+# The scheduler checks every 60s; trigger an immediate cycle instead of waiting
+curl -X POST http://localhost:8000/urls/check-now
+
+# Give it a couple seconds to complete, then confirm both monitors show a
+# latest_check with status_code, response_time_ms, and is_up populated
 curl http://localhost:8000/urls
 ```
 
@@ -159,12 +166,13 @@ Suggested path to production:
    like concurrent writers across multiple backend replicas. Keep the backend to a
    single replica with a persistent volume, or migrate to Postgres (RDS/Cloud SQL/
    managed Postgres) if you need to scale the backend horizontally.
-5. **Background checks**: whatever process performs the periodic URL health checks
-   should run as a singleton (one scheduler instance) even if the API layer scales,
-   to avoid duplicate/conflicting checks.
+5. **Background checks**: the scheduler that performs periodic URL health checks
+   runs in-process with the API (APScheduler), so it must stay a singleton — run
+   exactly one backend replica, or split the scheduler into its own service before
+   scaling the API horizontally, to avoid duplicate/conflicting checks.
 6. **Observability**: ship container logs to a log aggregator (CloudWatch, Loki,
-   Datadog) and add a `/health` endpoint on the backend for the platform's own
-   health checks, separate from the app-level `/urls` used in `docker-compose.yml`.
+   Datadog). The backend already exposes `GET /health` for platform-level health
+   checks, separate from the app-level `/urls` endpoint used by the frontend.
 7. **Secrets/config**: move the frontend's API base URL and any backend config
    (DB path, check interval) to environment variables read at build/runtime rather
    than hardcoded values, once there's more than one environment (staging/prod).
@@ -176,4 +184,5 @@ Suggested path to production:
 | Backend port | `backend/Dockerfile`, `docker-compose.yml` | `8000` | Exposed and published as `8000:8000` |
 | Frontend port | `docker-compose.yml` | `5173` (host) → `80` (container) | nginx serves the static build |
 | API base URL | `frontend/src/services/apiClient.ts` | `http://localhost:8000` | Update for non-local deployments |
-| SQLite data | `docker-compose.yml` volume `backend-data` | mounted at `/app/data` | Persists across rebuilds |
+| SQLite data | `docker-compose.yml` volume `backend-data`; local dev `backend/data/` | mounted at `/app/data` | Persists across rebuilds |
+| Check interval | `backend/app/scheduler.py` (`CHECK_INTERVAL_MINUTES`) | `1` minute | First check fires immediately on startup |
